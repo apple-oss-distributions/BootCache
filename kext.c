@@ -72,7 +72,7 @@
 /*
  * Wire the cache buffer.
  */
-#define WIRE_BUFFER
+/*#define WIRE_BUFFER*/
 
 /*
  * Ignore the prefetch attribute on playlist entries.
@@ -384,6 +384,7 @@ static struct BC_cache_control *BC_cache = &BC_cache_softc;
 
 static struct BC_cache_extent *BC_find_extent(u_int64_t offset, u_int64_t length, int contained);
 static int	BC_discard_blocks(struct BC_cache_extent *ce, u_int64_t offset, u_int64_t length);
+static int	BC_blocks_present(int base, int nblk);
 static void	BC_reader_thread(thread_call_param_t param0, thread_call_param_t param1);
 static void	BC_strategy_bypass(struct buf *bp);
 static void	BC_strategy(struct buf *bp);
@@ -626,6 +627,31 @@ BC_discard_blocks(struct BC_cache_extent *ce, u_int64_t offset, u_int64_t length
 		}
 	}
 	return(discarded);
+}
+
+/*
+ * Test for the presence of a range of blocks in the cache.
+ */
+static int
+BC_blocks_present(int base, int nblk)
+{
+	int	blk;
+	
+	for (blk = 0; blk < nblk; blk++) {
+		assert((base + blk) < BC_cache->c_buffer_blocks);
+		
+		if (!CB_BLOCK_PRESENT(BC_cache, base + blk)) {
+			BC_cache->c_stats.ss_hit_blkmissing++;
+			/*
+			 * Note that we could optionally flush blocks that *are*
+			 * present here, on the assumption that this was a read
+			 * overlapping another read, and nobody else is going to
+			 * subsequently want them.
+			 */
+			return(0);
+		}
+	}
+	return(1);
 }
 
 /*
@@ -884,7 +910,7 @@ BC_strategy(struct buf *bp)
 {
 	struct BC_cache_extent *ce;
 	kern_return_t kret;
-	int base, blk, nblk;
+	int base, nblk;
 	caddr_t m, p, s;
 	int retry;
 	struct timeval blocktime, now, elapsed;
@@ -923,6 +949,7 @@ BC_strategy(struct buf *bp)
 	/* if it's not a read, pass it off */
 	if (!ISSET(bp->b_flags, B_READ)) {
 		BC_handle_write(bp);
+		BC_add_history(CB_BLOCK_TO_BYTE(BC_cache, bp->b_blkno), bp->b_bcount, BC_HE_WRITE);
 		BC_cache->c_stats.ss_strategy_nonread++;
 		goto bypass;
 	}
@@ -1008,20 +1035,8 @@ BC_strategy(struct buf *bp)
 	    (bp->b_blkno - CB_BYTE_TO_BLOCK(BC_cache, ce->ce_offset));
 	nblk = CB_BYTE_TO_BLOCK(BC_cache, bp->b_bcount);
 	assert(base >= 0);
-	for (blk = 0; blk < nblk; blk++) {
-		assert((base + i) < BC_cache->c_buffer_blocks);
-		
-		if (!CB_BLOCK_PRESENT(BC_cache, base + blk)) {
-			BC_cache->c_stats.ss_hit_blkmissing++;
-			/*
-			 * Note that we could optionally flush blocks that *are*
-			 * present here, on the assumption that this was a read
-			 * overlapping another read, and nobody else is going to
-			 * subsequently want them.
-			 */
-			goto bypass;
-		}
-	}
+	if (!BC_blocks_present(base, nblk))
+		goto bypass;
 
 #ifdef EMULATE_ONLY
 	/* we would have hit this request */
@@ -1052,9 +1067,21 @@ BC_strategy(struct buf *bp)
 		p = bp->b_data;
 	}
 
-	/* we can definitely fulfil this request */
-	BC_add_history(CB_BLOCK_TO_BYTE(BC_cache, bp->b_blkno), bp->b_bcount, BC_HE_HIT);
-
+	/*
+	 * It is possible that ubc_upl_map will block, and during that
+	 * time we may have our cache blocks invalidated.  This shouldn't
+	 * happen, as the system will normally not allow overlapping I/O,
+	 * but it has been observed in practice.
+	 */
+	if (!BC_blocks_present(base, nblk)) {
+		/* if we mapped, unmap */
+		if (bp->b_data == NULL) {
+			ubc_upl_unmap((upl_t)bp->b_pagelist);	/* ignore result */
+		}
+		BC_cache->c_stats.ss_strategy_stolen++;
+		goto bypass;
+	}
+	
 	/* find the source in our buffer */
 	s = CB_BLOCK_TO_PTR(BC_cache, base);
 
@@ -1073,6 +1100,9 @@ BC_strategy(struct buf *bp)
 	/* discard blocks we have touched */
 	BC_cache->c_stats.ss_hit_blocks +=
 	    BC_discard_blocks(ce, CB_BLOCK_TO_BYTE(BC_cache, bp->b_blkno), bp->b_bcount);
+
+	/* record successful fulfilment (may block) */
+	BC_add_history(CB_BLOCK_TO_BYTE(BC_cache, bp->b_blkno), bp->b_bcount, BC_HE_HIT);
 #endif
 
 	/* we are not busy anymore */
@@ -1428,7 +1458,7 @@ BC_copyin_playlist(size_t length, void *uptr)
 	BC_cache->c_buffer_blocks = CB_BYTE_TO_BLOCK(BC_cache, size);
 	BC_cache->c_buffer_pages = CB_BLOCK_TO_PAGE(BC_cache, BC_cache->c_buffer_blocks);
 	if ((BC_cache->c_blockmap =
-		_MALLOC(BC_cache->c_buffer_blocks / CB_MAPFIELDBYTES,
+		_MALLOC(BC_cache->c_buffer_blocks / (CB_MAPFIELDBITS / CB_MAPFIELDBYTES),
 		    M_TEMP, M_WAITOK)) == NULL) {
 		message("can't allocate %d bytes for blockmap",
 		    BC_cache->c_buffer_blocks / CB_MAPFIELDBYTES);
@@ -1436,7 +1466,7 @@ BC_copyin_playlist(size_t length, void *uptr)
 		goto out;
 	}
 	if ((BC_cache->c_pagemap =
-		_MALLOC(BC_cache->c_buffer_pages / CB_MAPFIELDBYTES,
+		_MALLOC(BC_cache->c_buffer_pages / (CB_MAPFIELDBITS / CB_MAPFIELDBYTES),
 		    M_TEMP, M_WAITOK)) == NULL) {
 		message("can't allocate %d bytes for pagemap",
 		    BC_cache->c_buffer_pages / CB_MAPFIELDBYTES);
@@ -1840,11 +1870,11 @@ BC_sysctl SYSCTL_HANDLER_ARGS
 
 	/* get the commande structure and validate */
 	if ((error = SYSCTL_IN(req, &bc, sizeof(bc))) != 0) {
-		message("couldn't get command");
+		debug("couldn't get command");
 		return(error);
 	}
 	if (bc.bc_magic != BC_MAGIC) {
-		message("bad command magic");
+		debug("bad command magic");
 		return(EINVAL);
 	}
 
@@ -1940,7 +1970,6 @@ BC_sysctl SYSCTL_HANDLER_ARGS
 /*
  * Initialise the block of pages we use to back our data.
  *
- * XXX errors here need to clean up.
  */
 static int
 BC_alloc_pagebuffer(size_t size)
@@ -1950,7 +1979,7 @@ BC_alloc_pagebuffer(size_t size)
 	int i;
 
 	BC_cache->c_mapsize = size;
-	
+
 	/*
 	 * Create a VM region object (our private map).
 	 */
@@ -1962,7 +1991,7 @@ BC_alloc_pagebuffer(size_t size)
 		return(ENOMEM);
 	}
 	BC_cache->c_map = convert_port_entry_to_map(BC_cache->c_map_port);
-	
+
 	/*
 	 * Allocate and wire pages into our submap.
 	 */
@@ -2115,14 +2144,6 @@ BC_free_page(int page)
 	    BC_cache->c_mapbase + (page * PAGE_SIZE),	/* offset */
 	    PAGE_SIZE);					/* length */
 
-	pmap_remove(kernel_pmap, 
-	    BC_cache->c_mapbase 
-	    + (page * PAGE_SIZE) 
-	    + BC_cache->c_buffer, 
-	    BC_cache->c_mapbase
-	    + ((page+1) * PAGE_SIZE) 
-	    + BC_cache->c_buffer);
-
 	/*
 	 * Push the page completely out of the object.
 	 */
@@ -2132,7 +2153,6 @@ BC_free_page(int page)
 		UPL_POP_DUMP,				/* operation */
 		NULL,					/* phys_entry */
 		NULL);					/* flags */
-	
 }
 
 /*

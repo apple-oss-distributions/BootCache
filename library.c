@@ -4,8 +4,12 @@
  */
 
 
+/* XXX trim includes */
 #include <sys/param.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #include <err.h>
 #include <errno.h>
@@ -14,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
 
 #include "BootCache.h"
 
@@ -344,35 +349,39 @@ BC_convert_history(const struct BC_history_entry *he, struct BC_playlist_entry *
 {
 	struct BC_playlist_entry *pc, *pcp;
 	u_int64_t end;
-	int nentries, ent, pent, have_prefetch;
+	int oentries, nentries, ent, pent, have_prefetch;
 
 	if (he == NULL)
 		return(0);
-	nentries = *pnentries;
+	oentries = *pnentries;
 
-	if ((pc = malloc(sizeof(*pc) * nentries)) == NULL)
+	if ((pc = malloc(sizeof(*pc) * oentries)) == NULL)
 		return(ENOMEM);
 
 	/* scan history and convert */
 	have_prefetch = 0;
 	pcp = pc;
-	for (ent = 0; ent < nentries; ent++) {
+	nentries = 0;
+	for (ent = 0; ent < oentries; ent++, he++) {
 
 		/* if we find a prefetch tag, mark all earlier entries */
 		if (he->he_flags == BC_HE_TAG) {
 			have_prefetch = 1;
 			for (pent = 0; pent < ent; pent++)
 				(pc + pent)->pce_flags |= PCE_PREFETCH;
-			he++;
 			continue;
 		}
+
+		/* if we find a writethrough, discard it (debugging use only) */
+		if (he->he_flags == BC_HE_WRITE)
+			continue;
 
 		/* convert history entry across */
 		pcp->pce_offset = BLOCK_ROUNDDOWN(he->he_offset);
 		end = he->he_offset + he->he_length;
 		pcp->pce_length = BLOCK_ROUNDUP(end) - pcp->pce_offset;
-		he++;
 		pcp++;
+		nentries++;
 	}
 
 	if (have_prefetch != NULL)
@@ -515,6 +524,8 @@ BC_print_statistics(char *fname, struct BC_statistics *ss)
 	}
 	if (ss->ss_strategy_blocked > 0)
 		fprintf(fp, "callers blocked           %u\n", ss->ss_strategy_blocked);
+	if (ss->ss_strategy_stolen > 0)
+		fprintf(fp, "stolen page bypasses      %u\n", ss->ss_strategy_stolen);
 	if ((ss->ss_wait_time.tv_sec > 0) || (ss->ss_wait_time.tv_usec > 0)) {
 		msec = (ss->ss_wait_time.tv_sec * 1000) + (ss->ss_wait_time.tv_usec / 1000);
 		if (msec > 0) {
@@ -603,4 +614,36 @@ BC_tag_history(void)
 		return(ENOENT);
 	}
 	return(0);
+}
+
+/*
+ * Unload the BootCache kext.
+ */
+int
+BC_unload(void)
+{
+	pid_t	child;
+	char	*argv[4];
+	int	result;
+
+	child = fork();
+	switch (child) {
+	case -1:
+		/* fork failed, bail with error */
+		return(errno);
+	case 0:
+		/* we are the child, do our work */
+		argv[0] = BC_KEXTUNLOAD;
+		argv[1] = "-b";
+		argv[2] = BC_BUNDLE_ID;
+		argv[3] = NULL;
+		result = execve(BC_KEXTUNLOAD, argv, NULL);
+		exit((result != 0) ? 1 : 0);
+	default:
+		/* we are the parent, wait for the child */
+		waitpid(child, &result, 0);
+		break;
+	}
+	/* EBUSY is not a good error */
+	return((result != 0) ? EBUSY : 0);
 }
